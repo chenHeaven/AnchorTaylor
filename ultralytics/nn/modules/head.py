@@ -14,7 +14,7 @@ from .conv import Conv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder"
+__all__ = "Detect", "AuxDetect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder"
 
 
 class Detect(nn.Module):
@@ -92,6 +92,23 @@ class Detect(nn.Module):
     def decode_bboxes(self, bboxes, anchors):
         """Decode bounding boxes."""
         return dist2bbox(bboxes, anchors, xywh=True, dim=1)
+
+
+class AuxDetect(Detect):
+    """Training-only auxiliary detection head that caches predictions for an auxiliary loss."""
+
+    def __init__(self, nc=80, loss_weight=0.25, ch=()):
+        super().__init__(nc, ch)
+        self.loss_weight = float(loss_weight)
+        self.last_preds = None
+
+    def forward(self, x):
+        if not self.training:
+            self.last_preds = None
+            return x
+        preds = super().forward(x)
+        self.last_preds = preds
+        return preds
 
 
 class Segment(Detect):

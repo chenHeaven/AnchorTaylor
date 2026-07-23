@@ -93,9 +93,9 @@ __all__ = (
     "Add2",
     "Add",
     "myTransformerBlock",
-    "fusehd_second",
-    "fusehd_second_optimized",
-    "fusehd_third_optimized",
+    "TalorNet",
+    "getreturntalorfuse",
+    "getreturntalorir",
     "fusehd_fourth",
     "VMAMBA2BasicLayer",
     "getreturnir",
@@ -465,594 +465,158 @@ class VSSLayer(nn.Module):
             x = self.downsample(x)
         x=x.permute(0, 3, 1, 2)
         return x
-class fusehd_second(nn.Module):
-    """
-    Advanced fusion module with multi-scale grouped convolution fusion.
 
-    Features:
-    - Splits each modality into 4 channels
-    - Applies Haar wavelet transform per channel
-    - Low-frequency: grouped convolution fusion (ConvMixFusion-like)
-    - Fused low-freq: VSSBlock processing with residual
-    - High-frequency: element-wise max across modalities
-    - Multi-scale support: P2(4 groups), P3(2 groups), P5(original fusehd)
-    
+def _make_vmamba_config(channels, scale):
+    """Build the scale/channel-aware VMAMBA2 configuration used by fusion modules."""
+    expand = 2
+    d_inner = expand * channels
+    preferred_headdim = min(64, max(16, channels // 2))
+
+    if preferred_headdim >= d_inner:
+        headdim = d_inner
+    else:
+        factors = [i for i in range(1, min(preferred_headdim, d_inner) + 1) if d_inner % i == 0]
+        headdim = max(factors) if factors else 1
+
+    if channels <= 32:
+        d_state, drop_path = 16, 0.00
+    elif channels <= 64:
+        d_state, drop_path = 24, 0.05
+    elif channels <= 128:
+        d_state, drop_path = 32, 0.10
+    else:
+        d_state, drop_path = 48, 0.15
+
+    chunk_size = 128 if str(scale).lower() == "p2" else 256
+    return {
+        "drop_path": float(drop_path),
+        "d_state": int(d_state),
+        "expand": expand,
+        "headdim": int(headdim),
+        "ngroups": 1,
+        "chunk_size": int(chunk_size),
+        "use_cpe": True,
+    }
+
+
+class _TaylorDerivativeBlock(nn.Module):
+    """Approximate one Taylor derivative term without channel grouping."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+        )
+
+    def forward(self, term, ir_condition, rgb_condition):
+        return self.net(torch.cat((term, ir_condition, rgb_condition), dim=1))
+
+
+class TalorNet(nn.Module):
+    """IR-primary RGB-corrected Taylor fusion in the spatial feature domain.
+
+    IR builds the zero-order term ``g_0``. RGB is used as conditional
+    information by a derivative network shared across Taylor orders:
+
+        g_{k+1} = G([g_k, IR, RGB]) + k * g_k
+        output = g_0 + sum(g_k / k!), k=1..order
+
+    The module does not use wavelet decomposition or channel grouping. It
+    returns ``[fused, ir_zero]`` at the original spatial resolution so the main
+    and auxiliary detection branches can be supervised independently.
+
     Args:
-        c1: Input channels
-        c2: Output channels 
-        scale: Feature scale level ('p2', 'p3', 'p5')
-    
-    Returns:
-        [xlow_fuse, xhigh_fuse]: Fused low and high frequency features
+        c1 (int): Input channels for each modality.
+        c2 (int): Output channels of the fused feature.
+        scale (str): Feature scale used to configure the optional IR VMamba block.
+        order (int): Taylor approximation order. Must be at least 1.
+        use_vmamba (bool): Use VMAMBA2Block to refine the IR zero-order term.
     """
-    def __init__(self, c1, c2, scale='p2'):
+
+    def __init__(self, c1, c2, scale="p2", order=3, use_vmamba=True):
         super().__init__()
-        self.scale = scale.lower()
-        
-        # Determine number of groups and kernel sizes based on scale
-        if self.scale == 'p2':
-            self.num_groups = 4
-            self.kernel_sizes = [3, 3, 5, 7]  # alternating kernel sizes for diversity
-        elif self.scale == 'p3':
-            self.num_groups = 2
-            self.kernel_sizes = [3, 5]
-        else:  # p5 or default - fallback to original fusehd behavior
-            self.num_groups = 1
-            self.kernel_sizes = [3]
-            
-        # Channel split: c1 -> num_groups channels per group
-        assert c1 % self.num_groups == 0, f"c1={c1} must be divisible by num_groups={self.num_groups}"
-        self.channels_per_group = c1 // self.num_groups
-        
-        # Wavelet filters for each group (haar) - store as parameters not modules
-        self.wt_filters = nn.ParameterList()
-        for i in range(self.num_groups):
-            wt_filter, _ = create_wavelet_filter("haar", self.channels_per_group, 
-                                                  self.channels_per_group, torch.float)
-            self.wt_filters.append(nn.Parameter(wt_filter, requires_grad=False))
-        
-        # Grouped convolution fusion for low-frequency components (ConvMixFusion-like)
-        # Each modality has its own conv, then fuse with learnable weight
-        self.group_convs_rgb = nn.ModuleList()
-        self.group_convs_ir = nn.ModuleList()
-        self.group_fusion_fc = nn.ModuleList()  # learnable fusion weight per group
-        
-        for i in range(self.num_groups):
-            k = self.kernel_sizes[i]
-            padding = k // 2
-            # RGB and IR separate convolutions
-            self.group_convs_rgb.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            self.group_convs_ir.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            # Fusion weight generator (1x1 conv shared for each group)
-            self.group_fusion_fc.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=1, bias=True)
-            )
-        
-        # VSSBlock for each group's fused low-frequency (4 groups → 4 VSSBlocks)
-        self.vss_blocks = nn.ModuleList([
-            VSSBlock(hidden_dim=self.channels_per_group, drop_path=0.0, d_state=16)
-            for _ in range(self.num_groups)
-        ])
-        
-        # Optional: SpatialPriorModule-like processing for low-freq output
-        # Uncomment if needed for better spatial awareness
-        # self.spatial_prior = nn.Sequential(
-        #     nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
-        #     nn.BatchNorm2d(c1),
-        #     nn.ReLU(inplace=True)
-        # )
+        if order < 1:
+            raise ValueError(f"TalorNet order must be >= 1, but got {order}")
+
+        self.c1 = c1
+        self.c2 = c2
+        self.scale = str(scale).lower()
+        self.order = int(order)
+        self.use_vmamba = bool(use_vmamba)
+
+        self.ir_mapping = self._make_mapping(c1, c2)
+        self.ir_context = (
+            VMAMBA2Block(hidden_dim=c2, **_make_vmamba_config(c2, self.scale))
+            if self.use_vmamba
+            else nn.Identity()
+        )
+        self.rgb_condition = self._make_mapping(c1, c2)
+        self.derivative = _TaylorDerivativeBlock(c2)
+
+    @staticmethod
+    def _make_mapping(c1, c2):
+        return nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+        )
+
+    def _unfold_taylor(self, xir, xrgb):
+        """Build the IR zero-order term and progressively add RGB corrections."""
+        ir_condition = self.ir_mapping(xir)
+        if self.use_vmamba:
+            # VMAMBA2Block consumes NHWC and already contains its own residual.
+            ir_condition = self.ir_context(ir_condition.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        rgb_condition = self.rgb_condition(xrgb)
+
+        term = ir_condition  # g_0: the primary representation is IR-only.
+        output = term
+        factorial = 1
+        for k in range(self.order):
+            term = self.derivative(term, ir_condition, rgb_condition) + k * term
+            factorial *= k + 1
+            output = output + term / factorial
+        return output, ir_condition
 
     def forward(self, x):
-        """
-        Args:
-            x: [RGB_features, IR_features], each [B, C, H, W]
-        
-        Returns:
-            [xlow_fuse, xhigh_fuse]: Low and high frequency fused features
-        """
-        xrgb, xir = x[0], x[1]
-        B, C, H, W = xrgb.shape
-        
-        # Split into groups
-        xrgb_groups = torch.split(xrgb, self.channels_per_group, dim=1)
-        xir_groups = torch.split(xir, self.channels_per_group, dim=1)
-        
-        fused_low_groups = []
-        fused_high1_groups = []
-        fused_high2_groups = []
-        fused_high3_groups = []
-        
-        for i in range(self.num_groups):
-            # Wavelet transform for current group
-            wt_function = partial(wavelet_transform, filters=self.wt_filters[i])
-            
-            # RGB wavelet decomposition
-            xrgb_wt = wt_function(xrgb_groups[i])  # [B, C_group, 4, H/2, W/2]
-            xrgb_low = xrgb_wt[:, :, 0, :, :]     # LL
-            xrgb_high1 = xrgb_wt[:, :, 1, :, :]   # LH
-            xrgb_high2 = xrgb_wt[:, :, 2, :, :]   # HL
-            xrgb_high3 = xrgb_wt[:, :, 3, :, :]   # HH
-            
-            # IR wavelet decomposition
-            xir_wt = wt_function(xir_groups[i])
-            xir_low = xir_wt[:, :, 0, :, :]
-            xir_high1 = xir_wt[:, :, 1, :, :]
-            xir_high2 = xir_wt[:, :, 2, :, :]
-            xir_high3 = xir_wt[:, :, 3, :, :]
-            
-            # Low-frequency fusion: ConvMixFusion style
-            # Each modality goes through its own conv first
-            xrgb_low_conv = self.group_convs_rgb[i](xrgb_low)  # [B, C_group, H/2, W/2]
-            xir_low_conv = self.group_convs_ir[i](xir_low)    # [B, C_group, H/2, W/2]
-            
-            # Weighted fusion: alpha决定RGB和IR的融合比例（像素级、通道级自适应）
-            partial_sum = xrgb_low_conv + xir_low_conv
-            alpha = torch.sigmoid(self.group_fusion_fc[i](partial_sum))  # [B, C_group, H/2, W/2]
-            low_fused = xrgb_low_conv * alpha + xir_low_conv * (1 - alpha)
-            
-            # Save residual before VSSBlock
-            low_fused_residual = low_fused.clone()
-            
-            # VSSBlock processing for this group (requires [B, H, W, C] format)
-            low_fused = low_fused.permute(0, 2, 3, 1)  # [B, H/2, W/2, C_group]
-            low_fused = self.vss_blocks[i](low_fused)   # [B, H/2, W/2, C_group]
-            low_fused = low_fused.permute(0, 3, 1, 2)  # [B, C_group, H/2, W/2]
-            
-            # Add residual
-            low_fused = low_fused + low_fused_residual
-            
-            fused_low_groups.append(low_fused)
-            
-            # High-frequency fusion: element-wise max (preserving strongest features)
-            # Take max by absolute value, then keep sign
-            high1_fused = torch.where(torch.abs(xrgb_high1) >= torch.abs(xir_high1), 
-                                     xrgb_high1, xir_high1)
-            high2_fused = torch.where(torch.abs(xrgb_high2) >= torch.abs(xir_high2),
-                                     xrgb_high2, xir_high2)
-            high3_fused = torch.where(torch.abs(xrgb_high3) >= torch.abs(xir_high3),
-                                     xrgb_high3, xir_high3)
-            
-            # Collect high frequencies separately for each direction
-            fused_high1_groups.append(high1_fused)
-            fused_high2_groups.append(high2_fused)
-            fused_high3_groups.append(high3_fused)
-        
-        # Concatenate all groups (already processed by VSSBlock with residual)
-        xlow_fuse = torch.cat(fused_low_groups, dim=1)  # [B, C, H/2, W/2]
-        
-        # Optional spatial prior processing
-        # xlow_fuse = self.spatial_prior(xlow_fuse)
-        
-        # Concatenate high frequency groups by direction, then stack
-        xhigh1_fuse = torch.cat(fused_high1_groups, dim=1)  # [B, C, H/2, W/2]
-        xhigh2_fuse = torch.cat(fused_high2_groups, dim=1)  # [B, C, H/2, W/2]
-        xhigh3_fuse = torch.cat(fused_high3_groups, dim=1)  # [B, C, H/2, W/2]
-        
-        # Stack three directions: [B, C, 3, H/2, W/2]
-        xhigh_fuse = torch.stack([xhigh1_fuse, xhigh2_fuse, xhigh3_fuse], dim=2)
-        
-        return [xlow_fuse, xhigh_fuse]
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise TypeError("TalorNet expects [RGB_features, IR_features]")
 
-class fusehd_second_optimized(nn.Module):
-    def __init__(self, c1, c2, scale='p2', use_se=True, use_cross_group=True):
+        xrgb, xir = x
+        if xrgb.shape != xir.shape:
+            raise ValueError(
+                f"TalorNet requires aligned RGB/IR shapes, got {tuple(xrgb.shape)} and {tuple(xir.shape)}"
+            )
+
+        fused, ir_zero = self._unfold_taylor(xir, xrgb)
+        return [fused, ir_zero]
+
+
+class getreturntalorfuse(nn.Module):
+    """Select the Taylor-fused feature from ``TalorNet`` output."""
+
+    def __init__(self, c1, c2):
         super().__init__()
-        self.scale = scale.lower() if isinstance(scale, str) else 'p1'
-        self.use_se = use_se
-        self.use_cross_group = use_cross_group
-        
-        # Determine number of groups and kernel sizes based on scale
-        if self.scale == 'p2':
-            self.num_groups = 4
-            self.kernel_sizes = [3, 3, 5, 7]
-        elif self.scale == 'p3':
-            self.num_groups = 2
-            self.kernel_sizes = [3, 5]
-        else:
-            self.num_groups = 1
-            self.kernel_sizes = [3]
-            
-        assert c1 % self.num_groups == 0, f"c1={c1} must be divisible by num_groups={self.num_groups}"
-        self.channels_per_group = c1 // self.num_groups
-        
-        # Wavelet filters for each group
-        self.wt_filters = nn.ParameterList()
-        for i in range(self.num_groups):
-            wt_filter, _ = create_wavelet_filter("haar", self.channels_per_group, 
-                                                  self.channels_per_group, torch.float)
-            self.wt_filters.append(nn.Parameter(wt_filter, requires_grad=False))
-        
-        # Grouped convolution fusion for low-frequency
-        self.group_convs_rgb = nn.ModuleList()
-        self.group_convs_ir = nn.ModuleList()
-        self.group_fusion_fc = nn.ModuleList()
-        
-        for i in range(self.num_groups):
-            k = self.kernel_sizes[i]
-            padding = k // 2
-            self.group_convs_rgb.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            self.group_convs_ir.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            self.group_fusion_fc.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group, 
-                         kernel_size=1, bias=True)
-            )
-        
-        # VSSBlock for each group
-        self.vss_blocks = nn.ModuleList([
-            VSSBlock(hidden_dim=self.channels_per_group, drop_path=0.0, d_state=16)
-            for _ in range(self.num_groups)
-        ])
-        
-        # 优化1: 可学习的高频融合注意力机制（替代abs-max）
-        self.attn_high1 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        self.attn_high2 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        self.attn_high3 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        
-        # 优化2: 通道注意力模块（use_se=True 使用 SE，否则使用 ECA）
-        if self.use_se:
-            self.channel_attn_modules = nn.ModuleList([
-                nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Conv2d(self.channels_per_group, self.channels_per_group // 4, 1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(self.channels_per_group // 4, self.channels_per_group, 1),
-                    nn.Sigmoid()
-                ) for _ in range(self.num_groups)
-            ])
-        else:
-            self.channel_attn_modules = nn.ModuleList([
-                ECAAttention(self.channels_per_group) for _ in range(self.num_groups)
-            ])
-        
-        # 优化3: 跨组信息交互（使用1x1卷积）
-        if self.use_cross_group and self.num_groups > 1:
-            self.cross_group_conv = nn.Conv2d(c1, c1, kernel_size=1, bias=False)
-            self.cross_group_norm = nn.BatchNorm2d(c1)
-            self.cross_group_act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        xrgb, xir = x[0], x[1]
-        B, C, H, W = xrgb.shape
-        
-        # Split into groups
-        xrgb_groups = torch.split(xrgb, self.channels_per_group, dim=1)
-        xir_groups = torch.split(xir, self.channels_per_group, dim=1)
-        
-        fused_low_groups = []
-        fused_high1_groups = []
-        fused_high2_groups = []
-        fused_high3_groups = []
-        
-        for i in range(self.num_groups):
-            # Wavelet transform
-            wt_function = partial(wavelet_transform, filters=self.wt_filters[i])
-            
-            xrgb_wt = wt_function(xrgb_groups[i])
-            xrgb_low = xrgb_wt[:, :, 0, :, :]
-            xrgb_high1 = xrgb_wt[:, :, 1, :, :]
-            xrgb_high2 = xrgb_wt[:, :, 2, :, :]
-            xrgb_high3 = xrgb_wt[:, :, 3, :, :]
-            
-            xir_wt = wt_function(xir_groups[i])
-            xir_low = xir_wt[:, :, 0, :, :]
-            xir_high1 = xir_wt[:, :, 1, :, :]
-            xir_high2 = xir_wt[:, :, 2, :, :]
-            xir_high3 = xir_wt[:, :, 3, :, :]
-            
-            # Low-frequency fusion
-            xrgb_low_conv = self.group_convs_rgb[i](xrgb_low)
-            xir_low_conv = self.group_convs_ir[i](xir_low)
-            
-            # 优化4: 动态权重调整（结合全局上下文）
-            partial_sum = xrgb_low_conv + xir_low_conv
-            alpha = torch.sigmoid(self.group_fusion_fc[i](partial_sum))
-            low_fused = xrgb_low_conv * alpha + xir_low_conv * (1 - alpha)
-            
-            # 优化2: 通道注意力（use_se=True 使用 SE，否则使用 ECA）
-            low_fused = self.channel_attn_modules[i](low_fused)
-            
-            low_fused_residual = low_fused.clone()
-            
-            # VSSBlock processing
-            low_fused = low_fused.permute(0, 2, 3, 1)
-            low_fused = self.vss_blocks[i](low_fused)
-            low_fused = low_fused.permute(0, 3, 1, 2)
-            
-            # 优化4: 优化的残差连接
-            low_fused = low_fused + low_fused_residual
-            
-            fused_low_groups.append(low_fused)
-            
-            # 优化1: 可学习的高频融合注意力（替代abs-max）
-            concat1 = torch.cat([xrgb_high1, xir_high1], dim=1)
-            weights1 = self.attn_high1[i](concat1)
-            high1_fused = weights1[:, 0:1] * xrgb_high1 + weights1[:, 1:2] * xir_high1
-            
-            concat2 = torch.cat([xrgb_high2, xir_high2], dim=1)
-            weights2 = self.attn_high2[i](concat2)
-            high2_fused = weights2[:, 0:1] * xrgb_high2 + weights2[:, 1:2] * xir_high2
-            
-            concat3 = torch.cat([xrgb_high3, xir_high3], dim=1)
-            weights3 = self.attn_high3[i](concat3)
-            high3_fused = weights3[:, 0:1] * xrgb_high3 + weights3[:, 1:2] * xir_high3
-            
-            fused_high1_groups.append(high1_fused)
-            fused_high2_groups.append(high2_fused)
-            fused_high3_groups.append(high3_fused)
-        
-        # Concatenate all groups
-        xlow_fuse = torch.cat(fused_low_groups, dim=1)
-        
-        # 优化3: 跨组信息交互
-        if self.use_cross_group and self.num_groups > 1:
-            xlow_fuse = self.cross_group_conv(xlow_fuse)
-            xlow_fuse = self.cross_group_norm(xlow_fuse)
-            xlow_fuse = self.cross_group_act(xlow_fuse)
-        
-        # Concatenate high frequency groups
-        xhigh1_fuse = torch.cat(fused_high1_groups, dim=1)
-        xhigh2_fuse = torch.cat(fused_high2_groups, dim=1)
-        xhigh3_fuse = torch.cat(fused_high3_groups, dim=1)
-        
-        xhigh_fuse = torch.stack([xhigh1_fuse, xhigh2_fuse, xhigh3_fuse], dim=2)
-        
-        return [xlow_fuse, xhigh_fuse]
+        return x[0]
 
 
-class fusehd_third_optimized(nn.Module):
-    def __init__(self, c1, c2, scale='p2', use_se=True, use_cross_group=True):
+class getreturntalorir(nn.Module):
+    """Select the IR zero-order feature from ``TalorNet`` output."""
+
+    def __init__(self, c1, c2):
         super().__init__()
-        self.scale = scale.lower()
-        self.use_se = use_se
-        self.use_cross_group = use_cross_group
-        
-        # 根据scale确定分组数和卷积核大小
-        if self.scale == 'p2':
-            self.num_groups = 4
-            self.kernel_sizes = [3, 3, 5, 7]
-        elif self.scale == 'p3':
-            self.num_groups = 2
-            self.kernel_sizes = [3, 5]
-        else:
-            self.num_groups = 1
-            self.kernel_sizes = [3]
-        
-        assert c1 % self.num_groups == 0, f"c1={c1} must be divisible by num_groups={self.num_groups}"
-        self.channels_per_group = c1 // self.num_groups
-        
-        # 小波滤波器
-        self.wt_filters = nn.ParameterList()
-        for i in range(self.num_groups):
-            wt_filter, _ = create_wavelet_filter(
-                "haar", 
-                self.channels_per_group,
-                self.channels_per_group, 
-                torch.float
-            )
-            self.wt_filters.append(nn.Parameter(wt_filter, requires_grad=False))
-        
-        # 分组卷积（用于低频融合）
-        self.group_convs_rgb = nn.ModuleList()
-        self.group_convs_ir = nn.ModuleList()
-        self.group_fusion_fc = nn.ModuleList()
-        
-        for i in range(self.num_groups):
-            k = self.kernel_sizes[i]
-            padding = k // 2
-            self.group_convs_rgb.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group,
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            self.group_convs_ir.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group,
-                         kernel_size=k, padding=padding, bias=True)
-            )
-            self.group_fusion_fc.append(
-                nn.Conv2d(self.channels_per_group, self.channels_per_group,
-                         kernel_size=1, bias=True)
-            )
-        
-        # VMAMBA2Block 配置（可以根据 use_se 和 use_cross_group 调整）
-        expand = 2
-        d_inner = expand * self.channels_per_group
-        
-        # 自适应 headdim：确保能被 d_inner 整除
-        # 优先值：min(64, max(16, channels_per_group // 2))
-        preferred_headdim = min(64, max(16, self.channels_per_group // 2))
-        
-        # 找到 d_inner 的所有因子，选择不超过 preferred_headdim 的最大值
-        # 如果 preferred_headdim >= d_inner，直接使用 d_inner
-        if preferred_headdim >= d_inner:
-            headdim = d_inner
-        else:
-            # 找到所有因子，选择不超过 preferred_headdim 的最大值
-            factors = [i for i in range(1, min(preferred_headdim, d_inner) + 1) if d_inner % i == 0]
-            headdim = max(factors) if factors else 1
-        
-        vmamba_config = {
-            'drop_path': 0.0,
-            'd_state': 16,
-            'expand': expand,
-            'headdim': headdim,  # 确保能被 d_inner 整除
-            'ngroups': 1,
-            'chunk_size': 256,
-            'use_cpe': True,
-        }
-        
-        # 创建 VMAMBA2Block 模块列表
-        self.vss_blocks = nn.ModuleList([
-            VMAMBA2Block(
-                hidden_dim=self.channels_per_group,
-                **vmamba_config
-            )
-            for _ in range(self.num_groups)
-        ])
-        
-        # 优化1: 可学习的高频融合注意力机制（替代abs-max）
-        self.attn_high1 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        self.attn_high2 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        self.attn_high3 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.channels_per_group * 2, self.channels_per_group // 4, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.channels_per_group // 4, 2, 1),
-                nn.Softmax(dim=1)
-            ) for _ in range(self.num_groups)
-        ])
-        
-        # 优化2: SE通道注意力模块
-        if self.use_se:
-            self.se_modules = nn.ModuleList([
-                nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Conv2d(self.channels_per_group, self.channels_per_group // 4, 1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(self.channels_per_group // 4, self.channels_per_group, 1),
-                    nn.Sigmoid()
-                ) for _ in range(self.num_groups)
-            ])
-        
-        # 优化3: 跨组信息交互（使用全通道1x1卷积，实现真正的跨组信息交换）
-        if self.use_cross_group and self.num_groups > 1:
-            self.cross_group_conv = nn.Conv2d(c1, c1, kernel_size=1, bias=False)
-            self.cross_group_norm = nn.BatchNorm2d(c1)
-            self.cross_group_act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        xrgb, xir = x[0], x[1]
-        
-        # Split into groups
-        xrgb_groups = torch.split(xrgb, self.channels_per_group, dim=1)
-        xir_groups = torch.split(xir, self.channels_per_group, dim=1)
-        
-        fused_low_groups = []
-        fused_high1_groups = []
-        fused_high2_groups = []
-        fused_high3_groups = []
-        
-        for i in range(self.num_groups):
-            # Wavelet transform
-            wt_function = partial(wavelet_transform, filters=self.wt_filters[i])
-            
-            xrgb_wt = wt_function(xrgb_groups[i])
-            xrgb_low = xrgb_wt[:, :, 0, :, :]
-            xrgb_high1 = xrgb_wt[:, :, 1, :, :]
-            xrgb_high2 = xrgb_wt[:, :, 2, :, :]
-            xrgb_high3 = xrgb_wt[:, :, 3, :, :]
-            
-            xir_wt = wt_function(xir_groups[i])
-            xir_low = xir_wt[:, :, 0, :, :]
-            xir_high1 = xir_wt[:, :, 1, :, :]
-            xir_high2 = xir_wt[:, :, 2, :, :]
-            xir_high3 = xir_wt[:, :, 3, :, :]
-            
-            # Low-frequency fusion
-            xrgb_low_conv = self.group_convs_rgb[i](xrgb_low)
-            xir_low_conv = self.group_convs_ir[i](xir_low)
-            
-            # 优化4: 动态权重调整（结合全局上下文）
-            partial_sum = xrgb_low_conv + xir_low_conv
-            alpha = torch.sigmoid(self.group_fusion_fc[i](partial_sum))
-            low_fused = xrgb_low_conv * alpha + xir_low_conv * (1 - alpha)
-            
-            # 优化2: SE通道注意力
-            if self.use_se:
-                se_weight = self.se_modules[i](low_fused)
-                low_fused = low_fused * se_weight
-            
-            low_fused_residual = low_fused.clone()
-            
-            # VMAMBA2Block processing
-            low_fused = low_fused.permute(0, 2, 3, 1)
-            low_fused = self.vss_blocks[i](low_fused)
-            low_fused = low_fused.permute(0, 3, 1, 2)
-            
-            # 优化4: 优化的残差连接
-            low_fused = low_fused + low_fused_residual
-            
-            fused_low_groups.append(low_fused)
-            
-            # 优化1: 可学习的高频融合注意力（替代abs-max）
-            concat1 = torch.cat([xrgb_high1, xir_high1], dim=1)
-            weights1 = self.attn_high1[i](concat1)
-            high1_fused = weights1[:, 0:1] * xrgb_high1 + weights1[:, 1:2] * xir_high1
-            
-            concat2 = torch.cat([xrgb_high2, xir_high2], dim=1)
-            weights2 = self.attn_high2[i](concat2)
-            high2_fused = weights2[:, 0:1] * xrgb_high2 + weights2[:, 1:2] * xir_high2
-            
-            concat3 = torch.cat([xrgb_high3, xir_high3], dim=1)
-            weights3 = self.attn_high3[i](concat3)
-            high3_fused = weights3[:, 0:1] * xrgb_high3 + weights3[:, 1:2] * xir_high3
-            
-            fused_high1_groups.append(high1_fused)
-            fused_high2_groups.append(high2_fused)
-            fused_high3_groups.append(high3_fused)
-        
-        # Concatenate all groups
-        xlow_fuse = torch.cat(fused_low_groups, dim=1)
-        
-        # 优化3: 跨组信息交互
-        if self.use_cross_group and self.num_groups > 1:
-            xlow_fuse = self.cross_group_conv(xlow_fuse)
-            xlow_fuse = self.cross_group_norm(xlow_fuse)
-            xlow_fuse = self.cross_group_act(xlow_fuse)
-        
-        # Concatenate high frequency groups
-        xhigh1_fuse = torch.cat(fused_high1_groups, dim=1)
-        xhigh2_fuse = torch.cat(fused_high2_groups, dim=1)
-        xhigh3_fuse = torch.cat(fused_high3_groups, dim=1)
-        
-        xhigh_fuse = torch.stack([xhigh1_fuse, xhigh2_fuse, xhigh3_fuse], dim=2)
-        
-        return [xlow_fuse, xhigh_fuse]
+        return x[1]
+
 
 
 class fusehd_fourth(nn.Module):
@@ -1136,48 +700,7 @@ class fusehd_fourth(nn.Module):
     
     def _get_vmamba_config(self):
         """获取VMAMBA2Block配置"""
-        # NOTE:
-        # This config is used across YOLO scales (n/m/l). We don't get the YOLO "n/m/l" flag here,
-        # so we adapt using channel scale, which correlates strongly with n/m/l and stage depth.
-        expand = 2
-        d_inner = expand * self.channels_per_group
-        preferred_headdim = min(64, max(16, self.channels_per_group // 2))
-        
-        if preferred_headdim >= d_inner:
-            headdim = d_inner
-        else:
-            factors = [i for i in range(1, min(preferred_headdim, d_inner) + 1) if d_inner % i == 0]
-            headdim = max(factors) if factors else 1
-
-        # Scale-aware capacity + regularization (heuristic, stable defaults for M3FD).
-        # Larger channel groups (typical for YOLO m/l) benefit from larger state and a bit of stochastic depth.
-        cpg = int(self.channels_per_group)
-        if cpg <= 32:
-            d_state, drop_path = 16, 0.00
-        elif cpg <= 64:
-            d_state, drop_path = 24, 0.05
-        elif cpg <= 128:
-            d_state, drop_path = 32, 0.10
-        else:
-            d_state, drop_path = 48, 0.15
-
-        # Chunk size: keep smaller for larger spatial stages (p2) to control memory.
-        if self.scale in {"p2"}:
-            chunk_size = 128
-        elif self.scale in {"p3"}:
-            chunk_size = 256
-        else:  # p4 or fallback
-            chunk_size = 256
-        
-        return {
-            'drop_path': float(drop_path),
-            'd_state': int(d_state),
-            'expand': expand,
-            'headdim': int(headdim),
-            'ngroups': 1,
-            'chunk_size': int(chunk_size),
-            'use_cpe': True,
-        }
+        return _make_vmamba_config(self.channels_per_group, self.scale)
     
     def _init_level_modules(self, c1):
         """初始化单层级模块"""

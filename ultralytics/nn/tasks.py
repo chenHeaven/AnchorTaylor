@@ -90,9 +90,9 @@ from ultralytics.nn.modules import (
     Add,
     Add2,
     myTransformerBlock,
-    fusehd_second,
-    fusehd_second_optimized,
-    fusehd_third_optimized,
+    TalorNet,
+    getreturntalorfuse,
+    getreturntalorir,
     fusehd_fourth,
     spatial_fuse_ncssd,
     VMAMBA2BasicLayer,
@@ -109,6 +109,7 @@ from ultralytics.nn.modules import (
     VSSLayer,
     A2C2f,
     C3k2,
+    AuxDetect,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -441,6 +442,9 @@ class DetectionModel(BaseModel):
                     raise error
             self.stride = m.stride
             m.bias_init()  # only run once
+            for aux_head in (layer for layer in self.model if isinstance(layer, AuxDetect)):
+                aux_head.stride = m.stride.clone()
+                aux_head.bias_init()
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
@@ -494,25 +498,40 @@ class DetectionModel(BaseModel):
         return v8DetectionLoss(self)
 
     def loss(self, batch, preds=None):
-        """Compute loss; when batch has cls_ir/bboxes_ir/batch_idx_ir (dual labels), add weighted IR loss.
-        IR labels participate in Mosaic/LetterBox/flip etc. via instances_ir; weights from hyp (loss_rgb, loss_ir).
-        """
+        """Compute main detection loss plus the optional IR zero-order auxiliary loss."""
         if not hasattr(self, "criterion"):
             self.criterion = self.init_criterion()
         preds = self.forward(batch["img"]) if preds is None else preds
         w_rgb = batch.get("loss_rgb_weight", 1.0)
         w_ir = batch.get("loss_ir_weight", 1.0)
-        loss_rgb, loss_items = self.criterion(preds, batch)
-        if "cls_ir" in batch and batch["cls_ir"].numel() > 0:
-            dev = batch["bboxes"].device
-            batch_ir = {
-                "batch_idx": batch["batch_idx_ir"].view(-1, 1).to(device=dev, dtype=torch.long),
-                "cls": batch["cls_ir"].view(-1, 1).to(device=dev, dtype=torch.long) if batch["cls_ir"].dim() < 2 else batch["cls_ir"].to(device=dev, dtype=torch.long),
-                "bboxes": batch["bboxes_ir"].to(device=dev, dtype=batch["bboxes"].dtype),
-            }
-            loss_ir, _ = self.criterion(preds, batch_ir)
-            return w_rgb * loss_rgb + w_ir * loss_ir, loss_items
-        return w_rgb * loss_rgb, loss_items
+
+        def branch_loss(branch_preds):
+            loss_rgb, items = self.criterion(branch_preds, batch)
+            total = w_rgb * loss_rgb
+            weighted_items = w_rgb * items
+            if "cls_ir" in batch and batch["cls_ir"].numel() > 0:
+                dev = batch["bboxes"].device
+                batch_ir = {
+                    "batch_idx": batch["batch_idx_ir"].view(-1, 1).to(device=dev, dtype=torch.long),
+                    "cls": (
+                        batch["cls_ir"].view(-1, 1).to(device=dev, dtype=torch.long)
+                        if batch["cls_ir"].dim() < 2
+                        else batch["cls_ir"].to(device=dev, dtype=torch.long)
+                    ),
+                    "bboxes": batch["bboxes_ir"].to(device=dev, dtype=batch["bboxes"].dtype),
+                }
+                loss_ir, items_ir = self.criterion(branch_preds, batch_ir)
+                total = total + w_ir * loss_ir
+                weighted_items = weighted_items + w_ir * items_ir
+            return total, weighted_items
+
+        total_loss, loss_items = branch_loss(preds)
+        aux_head = next((layer for layer in self.model if isinstance(layer, AuxDetect)), None)
+        if aux_head is not None and aux_head.last_preds is not None:
+            aux_loss, aux_items = branch_loss(aux_head.last_preds)
+            total_loss = total_loss + aux_head.loss_weight * aux_loss
+            loss_items = loss_items + aux_head.loss_weight * aux_items
+        return total_loss, loss_items
 
 
 class OBBModel(DetectionModel):
@@ -1210,7 +1229,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn}:
+        elif m in {Detect, AuxDetect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -1239,57 +1258,27 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                c2 = make_divisible(min(c2, max_channels) * width, 8) 
             # print("Add2 arg", args[0])
             args = [c2, args[1]]
-        elif m is fusehd_second:
-            c1, c2 = ch[f[0]], args[0]
-            if c2 != nc:  # if not output
-               c2 = make_divisible(min(c2, max_channels) * width, 8)
-            # Keep scale parameter from yaml config (args[1])
-            scale = args[1] if len(args) > 1 else 'p2'
-            args = [c1, c2, scale]
-        elif m is fusehd_second_optimized:
-            c1, c2 = ch[f[0]], args[0]
-            if c2 != nc:  # if not output
-               c2 = make_divisible(min(c2, max_channels) * width, 8)
-            # 支持多种写法：
-            # [c2]
-            # [c2, use_se, use_cross_group]
-            # [c2, 'p1'/'p2'/'p3', use_se, use_cross_group, depth]
-            scale = 'p2'
-            use_se = True
-            use_cross_group = True
-            module_depth = 1
-
-            if len(args) > 1:
-                # 第二个参数若为字符串，则视为 scale
-                if isinstance(args[1], str):
-                    scale = args[1]
-                    if len(args) > 2:
-                        use_se = args[2]
-                    if len(args) > 3:
-                        use_cross_group = args[3]
-                    if len(args) > 4:
-                        module_depth = args[4]
-                else:
-                    # 否则按旧写法兼容：[c2, use_se, use_cross_group, depth]
-                    use_se = args[1]
-                    if len(args) > 2:
-                        use_cross_group = args[2]
-                    if len(args) > 3:
-                        module_depth = args[3]
-
-            # NOTE: `fusehd_second_optimized.__init__` 不接收 module_depth 参数。
-            # 这里仅使用它来解析 YAML 里的可选配置，但不传入模块，避免参数个数不匹配报错。
-            args = [c1, c2, scale, use_se, use_cross_group]
-        elif m is fusehd_third_optimized:
-            c1, c2 = ch[f[0]], args[0]
-            if c2 != nc:  # if not output
-               c2 = make_divisible(min(c2, max_channels) * width, 8)
-            # Keep scale parameter from yaml config (args[1])
-            scale = args[1] if len(args) > 1 else 'p2'
-            # Optional: use_se and use_cross_group parameters (args[2] and args[3])
-            use_se = args[2] if len(args) > 2 else True
-            use_cross_group = args[3] if len(args) > 3 else True
-            args = [c1, c2, scale, use_se, use_cross_group]
+        elif m is TalorNet:
+            c1_source = ch[f] if isinstance(f, int) else ch[f[0]]
+            c1, c2 = c1_source, args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            # Preferred YAML form: [c2, scale, order, use_vmamba].
+            # Keep [c2, order] compatible with the first spatial TalorNet draft.
+            if len(args) > 1 and isinstance(args[1], str):
+                scale = args[1]
+                taylor_order = args[2] if len(args) > 2 else 3
+                use_vmamba = args[3] if len(args) > 3 else False
+            else:
+                scale = "p2"
+                taylor_order = args[1] if len(args) > 1 else 3
+                use_vmamba = args[2] if len(args) > 2 else False
+            args = [c1, c2, scale, taylor_order, use_vmamba]
+        elif m in {getreturntalorfuse, getreturntalorir}:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2]
         elif m is fusehd_fourth:
             c1_source = ch[f] if isinstance(f, int) else ch[f[0]]
             c1, c2 = c1_source, args[0]
