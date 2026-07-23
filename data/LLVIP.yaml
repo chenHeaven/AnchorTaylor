@@ -1,0 +1,10 @@
+train: /home/asefu/data/LLVIP/images/train
+val: /home/asefu/data/LLVIP/images/val
+train_ir: /home/asefu/data/LLVIP/image/train
+val_ir: /home/asefu/data/LLVIP/image/val
+
+# Classes
+nc: 1  # number of classes
+names:
+  0: person
+
