@@ -93,6 +93,7 @@ __all__ = (
     "Add2",
     "Add",
     "myTransformerBlock",
+    "IRRGBGatedFusion",
     "TalorNet",
     "getreturntalorfuse",
     "getreturntalorir",
@@ -500,7 +501,7 @@ def _make_vmamba_config(channels, scale):
 
 
 class _TaylorDerivativeBlock(nn.Module):
-    """Approximate one Taylor derivative term without channel grouping."""
+    """Approximate ``epsilon^T grad_y(g_k)`` from ``[g_k, y, RGB]``."""
 
     def __init__(self, channels):
         super().__init__()
@@ -514,18 +515,63 @@ class _TaylorDerivativeBlock(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=1, bias=True),
         )
 
-    def forward(self, term, ir_condition, rgb_condition):
-        return self.net(torch.cat((term, ir_condition, rgb_condition), dim=1))
+    def forward(self, term, expansion_point, rgb_condition):
+        return self.net(torch.cat((term, expansion_point, rgb_condition), dim=1))
+
+
+class IRRGBGatedFusion(nn.Module):
+    """Lightweight IR-primary RGB fusion for high-resolution P2 features.
+
+    The spatial-channel gate starts close to the IR branch and learns where RGB
+    is useful:
+
+        output = IR + sigmoid(A([IR, RGB])) * (RGB - IR)
+
+    This module intentionally avoids VMamba and high-order Taylor recursion at
+    P2, where preserving local edges is more useful than adding heavy context.
+    """
+
+    def __init__(self, c1, c2, gate_bias=-2.0):
+        super().__init__()
+        self.rgb_projection = self._make_projection(c1, c2)
+        self.ir_projection = self._make_projection(c1, c2)
+        self.gate = nn.Conv2d(c2 * 2, c2, kernel_size=1, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias))
+
+    @staticmethod
+    def _make_projection(c1, c2):
+        if c1 == c2:
+            return nn.Identity()
+        return nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise TypeError("IRRGBGatedFusion expects [RGB_features, IR_features]")
+        rgb, ir = self.rgb_projection(x[0]), self.ir_projection(x[1])
+        if rgb.shape != ir.shape:
+            raise ValueError(f"Aligned RGB/IR features are required, got {tuple(rgb.shape)} and {tuple(ir.shape)}")
+        gate = torch.sigmoid(self.gate(torch.cat((ir, rgb), dim=1)))
+        return ir + gate * (rgb - ir)
 
 
 class TalorNet(nn.Module):
     """IR-primary RGB-corrected Taylor fusion in the spatial feature domain.
 
-    IR builds the zero-order term ``g_0``. RGB is used as conditional
-    information by a derivative network shared across Taylor orders:
+    IR first builds the expansion point ``y`` and then the zero-order term
+    ``g_0 = F(y)``. RGB is used as conditional information by a derivative
+    network shared across Taylor orders:
 
-        g_{k+1} = G([g_k, IR, RGB]) + k * g_k
-        output = g_0 + sum(g_k / k!), k=1..order
+        g_{k+1} = G([g_k, y, RGB]) + k * g_k
+        output = g_0 + sum(alpha_k * g_k / k!), k=1..order
+
+    Each ``alpha_k = tanh(a_k)`` is learnable and initialized with ``a_k=0``.
+    Consequently the initial fused representation is exactly ``g_0`` and RGB
+    corrections are introduced progressively during optimization.
 
     The module does not use wavelet decomposition or channel grouping. It
     returns ``[fused, ir_zero]`` at the original spatial resolution so the main
@@ -550,7 +596,11 @@ class TalorNet(nn.Module):
         self.order = int(order)
         self.use_vmamba = bool(use_vmamba)
 
-        self.ir_mapping = self._make_mapping(c1, c2)
+        # Keep the Taylor expansion point y and zero-order mapping F(y)
+        # explicitly separate. This is required by the paper's recurrence,
+        # whose directional derivative is taken with respect to y.
+        self.ir_projection = self._make_mapping(c1, c2)  # y = P_ir(x_ir)
+        self.ir_mapping = self._make_mapping(c2, c2)     # g_0 = F(y)
         self.ir_context = (
             VMAMBA2Block(hidden_dim=c2, **_make_vmamba_config(c2, self.scale))
             if self.use_vmamba
@@ -558,6 +608,11 @@ class TalorNet(nn.Module):
         )
         self.rgb_condition = self._make_mapping(c1, c2)
         self.derivative = _TaylorDerivativeBlock(c2)
+        # tanh(0) = 0, so every Taylor correction is disabled at
+        # initialization and the module starts exactly from the stable IR
+        # zero-order representation. The gates then learn how much RGB
+        # correction each order should contribute.
+        self.correction_gates = nn.Parameter(torch.zeros(self.order))
 
     @staticmethod
     def _make_mapping(c1, c2):
@@ -569,20 +624,24 @@ class TalorNet(nn.Module):
 
     def _unfold_taylor(self, xir, xrgb):
         """Build the IR zero-order term and progressively add RGB corrections."""
-        ir_condition = self.ir_mapping(xir)
+        expansion_point = self.ir_projection(xir)
+        ir_zero = self.ir_mapping(expansion_point)
         if self.use_vmamba:
             # VMAMBA2Block consumes NHWC and already contains its own residual.
-            ir_condition = self.ir_context(ir_condition.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            ir_zero = self.ir_context(ir_zero.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         rgb_condition = self.rgb_condition(xrgb)
 
-        term = ir_condition  # g_0: the primary representation is IR-only.
+        term = ir_zero
         output = term
         factorial = 1
         for k in range(self.order):
-            term = self.derivative(term, ir_condition, rgb_condition) + k * term
+            # G([g_k, y, r]) approximates epsilon^T grad_y(g_k).
+            directional_term = self.derivative(term, expansion_point, rgb_condition)
+            term = directional_term + k * term
             factorial *= k + 1
-            output = output + term / factorial
-        return output, ir_condition
+            alpha_k = torch.tanh(self.correction_gates[k])
+            output = output + alpha_k * term / factorial
+        return output, ir_zero
 
     def forward(self, x):
         if not isinstance(x, (list, tuple)) or len(x) != 2:
