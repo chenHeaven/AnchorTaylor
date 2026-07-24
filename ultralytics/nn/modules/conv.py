@@ -501,7 +501,7 @@ def _make_vmamba_config(channels, scale):
 
 
 class _TaylorDerivativeBlock(nn.Module):
-    """Approximate ``epsilon^T grad_y(g_k)`` from ``[g_k, y, RGB]``."""
+    """Approximate the next RGB-directional term from ``[g_k, y, delta]``."""
 
     def __init__(self, channels):
         super().__init__()
@@ -515,8 +515,8 @@ class _TaylorDerivativeBlock(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=1, bias=True),
         )
 
-    def forward(self, term, expansion_point, rgb_condition):
-        return self.net(torch.cat((term, expansion_point, rgb_condition), dim=1))
+    def forward(self, term, ir_condition, rgb_innovation):
+        return self.net(torch.cat((term, ir_condition, rgb_innovation), dim=1))
 
 
 class IRRGBGatedFusion(nn.Module):
@@ -560,18 +560,27 @@ class IRRGBGatedFusion(nn.Module):
 
 
 class TalorNet(nn.Module):
-    """IR-primary RGB-corrected Taylor fusion in the spatial feature domain.
+    """IR-primary Taylor-inspired expansion along an RGB innovation variable.
 
-    IR first builds the expansion point ``y`` and then the zero-order term
-    ``g_0 = F(y)``. RGB is used as conditional information by a derivative
-    network shared across Taylor orders:
+    The two modalities are projected to ``y=P_ir(IR)`` and ``r=P_rgb(RGB)``.
+    An IR-conditioned predictor estimates the RGB information already explained
+    by IR, ``r_hat=Q(y)``, and the complementary direction is
+    ``delta=r-r_hat``. For the conceptual fusion function ``Psi(y, u)``, the
+    zero-order term is ``g_0=Psi(y, 0)`` and higher-order terms are derivatives
+    with respect to the RGB compensation variable ``u`` along ``delta``.
 
-        g_{k+1} = G([g_k, y, RGB]) + k * g_k
-        output = g_0 + sum(alpha_k * g_k / k!), k=1..order
+    A shared neural block approximates this directional derivative recursion:
 
-    Each ``alpha_k = tanh(a_k)`` is learnable and initialized with ``a_k=0``.
-    Consequently the initial fused representation is exactly ``g_0`` and RGB
-    corrections are introduced progressively during optimization.
+        g_hat_{k+1} = G_theta([g_hat_k, y, delta])
+        output = g_hat_0 + sum(alpha_k * g_hat_k / k!), k=1..order
+
+    There is deliberately no ``+ k*g_k`` term: that term belongs to the
+    different assumption ``epsilon=y_star-y`` with ``d epsilon/dy=-I``. Here
+    ``delta`` is fixed while differentiating with respect to ``u``.
+
+    Each ``alpha_k=tanh(a_k)`` is learnable. A small nonzero initialization
+    keeps the initial output close to ``g_0`` while allowing the derivative and
+    RGB-innovation paths to receive gradients from the first optimization step.
 
     The module does not use wavelet decomposition or channel grouping. It
     returns ``[fused, ir_zero]`` at the original spatial resolution so the main
@@ -596,9 +605,8 @@ class TalorNet(nn.Module):
         self.order = int(order)
         self.use_vmamba = bool(use_vmamba)
 
-        # Keep the Taylor expansion point y and zero-order mapping F(y)
-        # explicitly separate. This is required by the paper's recurrence,
-        # whose directional derivative is taken with respect to y.
+        # Keep the IR condition y and the zero-order mapping Psi(y, 0)
+        # explicitly separate from the RGB innovation direction delta.
         self.ir_projection = self._make_mapping(c1, c2)  # y = P_ir(x_ir)
         self.ir_mapping = self._make_mapping(c2, c2)     # g_0 = F(y)
         self.ir_context = (
@@ -606,13 +614,13 @@ class TalorNet(nn.Module):
             if self.use_vmamba
             else nn.Identity()
         )
-        self.rgb_condition = self._make_mapping(c1, c2)
+        self.rgb_projection = self._make_mapping(c1, c2)  # r = P_rgb(x_rgb)
+        # Start both modality projections in the same coordinate system while
+        # keeping their parameters independent during training.
+        self.rgb_projection.load_state_dict(self.ir_projection.state_dict())
+        self.rgb_predictor = self._make_rgb_predictor(c2)  # Q(y) = y + R(y)
         self.derivative = _TaylorDerivativeBlock(c2)
-        # tanh(0) = 0, so every Taylor correction is disabled at
-        # initialization and the module starts exactly from the stable IR
-        # zero-order representation. The gates then learn how much RGB
-        # correction each order should contribute.
-        self.correction_gates = nn.Parameter(torch.zeros(self.order))
+        self.correction_gates = nn.Parameter(torch.full((self.order,), 0.01))
 
     @staticmethod
     def _make_mapping(c1, c2):
@@ -622,6 +630,19 @@ class TalorNet(nn.Module):
             nn.SiLU(inplace=True),
         )
 
+    @staticmethod
+    def _make_rgb_predictor(channels):
+        """Build residual ``R`` in ``Q(y)=y+R(y)``, initially making ``Q`` identity."""
+        predictor = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+        )
+        nn.init.zeros_(predictor[-1].weight)
+        nn.init.zeros_(predictor[-1].bias)
+        return predictor
+
     def _unfold_taylor(self, xir, xrgb):
         """Build the IR zero-order term and progressively add RGB corrections."""
         expansion_point = self.ir_projection(xir)
@@ -629,15 +650,17 @@ class TalorNet(nn.Module):
         if self.use_vmamba:
             # VMAMBA2Block consumes NHWC and already contains its own residual.
             ir_zero = self.ir_context(ir_zero.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        rgb_condition = self.rgb_condition(xrgb)
+        rgb_feature = self.rgb_projection(xrgb)
+        predicted_rgb = expansion_point + self.rgb_predictor(expansion_point)
+        rgb_innovation = rgb_feature - predicted_rgb
 
         term = ir_zero
         output = term
         factorial = 1
         for k in range(self.order):
-            # G([g_k, y, r]) approximates epsilon^T grad_y(g_k).
-            directional_term = self.derivative(term, expansion_point, rgb_condition)
-            term = directional_term + k * term
+            # G([g_k, y, delta]) approximates the next derivative of Psi(y, u)
+            # with respect to u, evaluated at u=0 along the fixed delta.
+            term = self.derivative(term, expansion_point, rgb_innovation)
             factorial *= k + 1
             alpha_k = torch.tanh(self.correction_gates[k])
             output = output + alpha_k * term / factorial
