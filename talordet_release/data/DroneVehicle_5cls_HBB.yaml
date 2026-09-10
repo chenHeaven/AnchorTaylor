@@ -1,0 +1,14 @@
+# Change this path to the prepared five-class horizontal-box dataset root.
+path: /absolute/path/to/DroneVehicle_5cls_HBB
+train: images/train
+val: images/val
+train_ir: image/train
+val_ir: image/val
+
+nc: 5
+names:
+  0: bus
+  1: car
+  2: freight_car
+  3: truck
+  4: van

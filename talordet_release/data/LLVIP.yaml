@@ -1,0 +1,10 @@
+# Change this path to the extracted LLVIP dataset root.
+path: /absolute/path/to/LLVIP
+train: images/train
+val: images/val
+train_ir: image/train
+val_ir: image/val
+
+nc: 1
+names:
+  0: person

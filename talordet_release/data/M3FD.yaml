@@ -1,0 +1,15 @@
+# Change this path to the extracted M3FD dataset root.
+path: /absolute/path/to/M3FD_YOLO
+train: images/train
+val: images/val
+train_ir: image/train
+val_ir: image/val
+
+nc: 6
+names:
+  0: car
+  1: truck
+  2: people
+  3: bus
+  4: lamp
+  5: motorcycle
