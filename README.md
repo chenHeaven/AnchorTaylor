@@ -10,7 +10,8 @@ The clean release is under [`talordet_release/`](talordet_release/). It contains
 - pretrained RGB anchoring with paired RGB/infrared input;
 - P2 budgeted bidirectional detail exchange;
 - P3 third-order recursive correction;
-- dataset templates, three-seed scripts, environment capture, and result aggregation;
+- horizontal-box training for M3FD and LLVIP, including the three-seed M3FD recipe;
+- five-class DroneVehicle oriented-box training, pair inference, and exact polygon-IoU evaluation;
 - no datasets, experiment runs, or trained checkpoints.
 
 Start with [`talordet_release/README.md`](talordet_release/README.md). Historical

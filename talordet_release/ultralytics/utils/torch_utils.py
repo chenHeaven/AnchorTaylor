@@ -66,7 +66,12 @@ def smart_inference_mode():
 
 def get_cpu_info():
     """Return a string with system CPU information, i.e. 'Apple M2'."""
-    import cpuinfo  # pip install py-cpuinfo
+    try:
+        import cpuinfo
+    except ImportError:
+        import platform
+
+        return platform.processor() or platform.machine()
 
     k = "brand_raw", "hardware_raw", "arch_string_raw"  # info keys sorted by preference (not all keys always available)
     info = cpuinfo.get_cpu_info()  # info dict

@@ -75,6 +75,13 @@ def build_yaml(args, nc):
     with open(MODEL_TEMPLATES[args.model_family], encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config.update(nc=nc, ch=6, scale=args.model_scale)
+    if args.task == "obb":
+        # Keep the complete AnchorTaylor backbone/neck graph and replace only
+        # the terminal prediction head.  Ultralytics infers the OBB task from
+        # this module and consequently selects the rotated loss, validator and
+        # NMS implementation.
+        config["head"][-1][2] = "OBB"
+        config["head"][-1][3] = ["nc", 1]
     internal_mode = {"p3_mean": "mean", "p3_residual": "residual"}.get(args.mode, args.mode)
     config["pretrained_anchor_fusion"] = {
         "mode": internal_mode,
@@ -136,15 +143,20 @@ def build_yaml(args, nc):
         "family": "pretrained_anchor_p3_fusion",
         "source": str(args.source) if args.source else None,
         "initialization": "scratch" if args.no_pretrained else "pretrained",
-        "official_pretrained_origin": None if args.no_pretrained else f"{args.model_family}{args.model_scale}.pt",
+        "official_pretrained_origin": None if args.no_pretrained else args.source.name,
         "architecture_scope": (
             "YOLO11 backbone/neck with legacy Detect" if args.model_family == "yolo11" else "YOLOv8"
         ),
         "model_scale": args.model_scale,
+        "task": args.task,
     }
     directory = ROOT / "weights/model_configs"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{args.name}_nc{nc}_anchor_{args.model_family}{args.model_scale}.yaml"
+    filename = f"{args.name}_nc{nc}_anchor_{args.model_family}{args.model_scale}.yaml"
+    if args.task == "obb":
+        # The YAML loader infers the OBB model scale from the filename.
+        filename = f"yolov8{args.model_scale}_{filename}"
+    path = directory / filename
     with open(path, "w", encoding="utf-8") as file:
         yaml.safe_dump(config, file, allow_unicode=True, sort_keys=False)
     return path
@@ -172,6 +184,7 @@ def parse_args():
                                 help="Build from YAML without loading any external initialization weights.")
     parser.add_argument("--model-family", choices=("yolo8", "yolo11"), default="yolo8")
     parser.add_argument("--model-scale", choices=("n", "s", "m", "l", "x"), default="n")
+    parser.add_argument("--task", choices=("detect", "obb"), default="detect")
     parser.add_argument(
         "--mode", choices=("rgb_only", "ir_only", "p2_only", "p3_mean", "p3_residual"), required=True
     )
@@ -243,6 +256,8 @@ def validate_args(args):
         raise ValueError(f"Global batch {args.batch} must be divisible by DDP world size {len(devices)}")
     if args.imgsz % 32:
         raise ValueError("--imgsz must be divisible by 32")
+    if args.task == "obb" and args.model_family != "yolo8":
+        raise ValueError("The paper OBB protocol currently supports only the YOLOv8 model family")
     if not 0 <= args.anchor_freeze_epochs < args.epochs:
         raise ValueError("--anchor-freeze-epochs must satisfy 0 <= value < epochs")
     if args.mode in {"rgb_only", "ir_only"} and args.anchor_freeze_epochs:
@@ -424,6 +439,7 @@ def main():
         "name": args.name,
         "mode": args.mode,
         "model_scale": args.model_scale,
+        "task": args.task,
         "model_family": args.model_family,
         "taylor_order": args.taylor_order,
         "scale_assignment": args.scale_assignment,
@@ -471,7 +487,18 @@ def main():
     with open(audit_dir / f"{args.name}_anchor_audit.json", "w", encoding="utf-8") as file:
         json.dump(audit, file, ensure_ascii=False, indent=2)
     print(json.dumps(audit, ensure_ascii=False, indent=2))
-    model.ckpt = {"model": detector}
+    # ``attempt_load_one_weight`` reconstructs ``model.args`` from the
+    # checkpoint-level ``train_args`` field before it inspects the head.  If a
+    # hand-built initialization checkpoint omits that field, the default
+    # ``task=detect`` masks an OBB head in DDP subprocesses.  Persist the task
+    # explicitly so single-process and DDP initialization select the same
+    # trainer and criterion.
+    checkpoint_args = dict(detector.args) if isinstance(detector.args, dict) else vars(detector.args).copy()
+    checkpoint_args["task"] = args.task
+    detector.args = checkpoint_args
+    detector.task = args.task
+    model.task = args.task
+    model.ckpt = {"model": detector, "train_args": checkpoint_args}
     devices = [item.strip() for item in str(args.device).split(",") if item.strip()]
     ddp_init_path = None
     if len(devices) > 1:
@@ -481,6 +508,11 @@ def main():
         ddp_init_path = audit_dir / f"{args.name}_ddp_init.pt"
         model.save(ddp_init_path)
         reloaded = YOLO(str(ddp_init_path))
+        if reloaded.task != args.task or reloaded.model.args.get("task") != args.task:
+            raise RuntimeError(
+                f"DDP initialization task changed from {args.task!r} to "
+                f"wrapper={reloaded.task!r}, model={reloaded.model.args.get('task')!r}"
+            )
         original_state = detector.state_dict()
         reloaded_state = reloaded.model.state_dict()
         if original_state.keys() != reloaded_state.keys() or any(

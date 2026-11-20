@@ -32,7 +32,7 @@ Edit the top-level `path:` field in one of these files:
 
 - `data/M3FD.yaml`
 - `data/LLVIP.yaml`
-- `data/DroneVehicle_5cls_HBB.yaml`
+- `data/DroneVehicle_5cls_OBB.yaml` (paper protocol)
 
 Expected layout:
 
@@ -50,23 +50,41 @@ DATASET_ROOT/
 ```
 
 `images/` stores RGB images and `image/` stores infrared images. Paired files
-must have the same relative filename and stem. Labels use standard YOLO
-normalized `class x_center y_center width height` rows and correspond to the
-RGB path. Verify a configuration before training:
+must have the same relative filename and stem. M3FD and LLVIP use normalized horizontal
+YOLO boxes (`class cx cy w h`). DroneVehicle uses five-class oriented boxes
+(`class x1 y1 x2 y2 x3 y3 x4 y4`, four normalized corner coordinates per axis).
+The historical `DroneVehicle_5cls_HBB.yaml` template is for horizontal-box
+experiments. The paper uses the infrared polygon annotations for both streams.
+
+Run `python tools/check_dataset.py data/M3FD.yaml` to check the paired file
+inventories and class count.
+
+### Prepare DroneVehicle
+
+Use an empty output path. The converter expects RGB, IR and IR annotation XML
+directories under the source root as follows. Arrange the source folders or
+symlink them to these paths before conversion.
+
+| Split | RGB | IR | IR XML |
+| --- | --- | --- | --- |
+| train | `images/trainimg` | `image/trainimgr` | `labels11111/trainlabelr` |
+| val | `images/valimg` | `image/valimgr` | `labels11111/vallabelr` |
 
 ```bash
-python tools/check_dataset.py data/M3FD.yaml
+DV_ROOT=/absolute/path/to/DroneVehicle_5cls_OBB
+python tools/prepare_dronevehicle_5cls_obb.py --source /path/to/raw/DroneVehicle \
+  --output "$DV_ROOT" --splits train val --image-mode crop
 ```
 
-The DroneVehicle template describes the paper's five-class horizontal-box
-protocol after removing the 100-pixel image border. Dataset conversion is not
-performed automatically because the source annotation license and local source
-layout may differ.
+The converter removes the 100-pixel border from 840×712 pairs, adjusts the
+corners to the 640×512 crop and writes labels in class-ID order
+`bus, car, freight_car, truck, van`. Set `path:` in
+`data/DroneVehicle_5cls_OBB.yaml` to the absolute output directory.
 
-## 3. Official pretrained checkpoint
+## 3. Official pretrained checkpoints
 
-Place the official `yolov8n.pt` checkpoint in this directory or pass its full
-path through `--source`. The checkpoint is not redistributed.
+Use the official `yolov8n.pt` for M3FD and LLVIP and `yolov8n-obb.pt` for
+the DroneVehicle n model. Pass the local checkpoint path via `--source`.
 
 ## 4. Initialization audit
 
@@ -89,7 +107,7 @@ python train.py \
   --correct-border --audit-only
 ```
 
-## 5. Three-seed training
+## 5. M3FD horizontal-box training
 
 The wrapper records software/hardware metadata and trains seeds 0, 1, and 2
 without overwriting existing runs.
@@ -102,32 +120,53 @@ DEVICE=0,1 bash scripts/run_three_seeds.sh \
   data/M3FD.yaml yolov8n.pt m3fd_workstation_a
 ```
 
-DroneVehicle cross-platform recipe, run independently on each machine:
+The wrapper summarizes the three training logs at their best-fitness epochs.
+The M3FD main comparison separately re-evaluates the saved best checkpoints.
+
+## DroneVehicle oriented-box training and evaluation
+
+The paper's n-model result uses seed 0. Run the following command from
+`talordet_release/`. To audit initialization first, append `--audit-only`.
+Choose the two visible GPU IDs for your machine with `--device`.
 
 ```bash
-BATCH=128 NBS=128 EPOCHS=120 PATIENCE=40 LR0=0.001 CLOSE_MOSAIC=20 \
-DEVICE=0,1 bash scripts/run_three_seeds.sh \
-  data/DroneVehicle_5cls_HBB.yaml yolov8n.pt drone_workstation_a
+python train.py --name drone_yolov8n_obb_seed0 --data data/DroneVehicle_5cls_OBB.yaml \
+  --source yolov8n-obb.pt --model-family yolo8 --model-scale n --task obb \
+  --mode p3_residual --p3-anchor rgb --taylor-order 3 --recurrence additive \
+  --fusion-hidden 16 --gate-max 0.25 --p2-bidirectional-main \
+  --p2-main-hidden 16 --p2-main-gate-max 0.10 \
+  --device 0,1 --batch 128 --nbs 128 --val-batch 64 --workers 8 --imgsz 640 --amp \
+  --epochs 120 --patience 40 --init-seed 0 --train-seed 0 --lr0 0.001 --lrf 0.05 \
+  --warmup-epochs 5 --weight-decay 0.0005 --mosaic 1.0 --close-mosaic 20 \
+  --correct-border --anchor-freeze-epochs 0 --module-diagnostics --diagnostic-interval 50
 ```
 
-Use a different platform tag on the second machine, for example
-`drone_workstation_b`. Keep the data split, checkpoint checksum, batch size,
-optimizer, and stopping rule identical. The script writes platform metadata to
-`runs/platform/` and training outputs to `runs/detect/`.
-
-Summarize the three seeds:
+Use the selected `best.pt` for the common evaluation. The training validator
+uses ProbIoU for matching. The paper scores exported corners with exact
+polygon IoU and 101-point interpolated AP. The evaluation split comprises the
+1,469 validation pairs with 24,490 annotated objects. The official test split
+has 8,980 pairs and is a separate benchmark.
 
 ```bash
-python tools/collect_seed_results.py \
-  --runs runs/detect/drone_workstation_a_seed0 \
-         runs/detect/drone_workstation_a_seed1 \
-         runs/detect/drone_workstation_a_seed2
+EVAL=runs/drone_polygon_eval
+python tools/export_dronevehicle_obb_ground_truth.py --labels "$DV_ROOT/labels/val" \
+  --output "$EVAL/gt.csv" --image-ids-output "$EVAL/image_ids.txt"
+python -m tools.export_anchortaylor_obb_predictions \
+  --weights runs/detect/drone_yolov8n_obb_seed0/weights/best.pt \
+  --data data/DroneVehicle_5cls_OBB.yaml --device 0 --batch 8 \
+  --image-ids "$EVAL/image_ids.txt" --output "$EVAL/predictions.csv"
+python tools/evaluate_dronevehicle_obb.py --ground-truth "$EVAL/gt.csv" \
+  --predictions "$EVAL/predictions.csv" --image-ids "$EVAL/image_ids.txt" \
+  --output "$EVAL/polygon_metrics.json"
 ```
 
-The paper reports every seed plus mean and sample standard deviation. Do not
-substitute a best-seed score for the mean.
+The n-model reference is **81.8% OBB mAP50 and 52.2% OBB mAP50–95**.
+Read these metrics from `polygon_metrics.json` (fractions, multiply by 100).
+The exporter also writes the native validator scores to `native_metrics.json`.
 
 ## 6. Pair inference
+
+A horizontal detector draws rectangles. An OBB checkpoint draws the four predicted corners on the RGB image. For DroneVehicle, supply the cropped pair.
 
 ```bash
 python predict_pair.py \
@@ -139,14 +178,15 @@ python predict_pair.py \
 
 ## Pretraining result and reproducibility boundary
 
-Under the matched M3FD recipe, random initialization obtains `53.41+/-0.21`
-mAP, whereas RGB-pretrained initialization obtains `59.15+/-0.45`. The paired
-gains for seeds 0, 1, and 2 are `+5.679`, `+5.356`, and `+6.186` points. The
-effect is therefore consistent across the tested seeds and much larger than
-the within-condition variation. This demonstrates the value of external RGB
-pretraining under the fixed budget; it is not an upper bound on a separately
-tuned from-scratch recipe. Cross-platform repeatability must still be measured
-directly.
+M3FD training-time mAP50–95 (%) under the matched budget, at the best-fitness epoch:
+
+| Initialization | Seed 0 | Seed 1 | Seed 2 | Mean ± sample SD |
+| --- | ---: | ---: | ---: | ---: |
+| Random | 53.656 | 53.276 | 53.292 | 53.41 ± 0.21 |
+| RGB-pretrained | 59.335 | 59.618 | 59.478 | 59.48 ± 0.14 |
+
+The paper uses the repeat run for pretrained seed 1. The mean gain is 6.07
+percentage points. These values describe the fixed training budget.
 
 ## License
 

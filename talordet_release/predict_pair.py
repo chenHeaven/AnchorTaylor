@@ -63,14 +63,21 @@ def main() -> int:
     rendered = rgb.copy()
     scale_x, scale_y = original_w / args.imgsz, original_h / args.imgsz
     names = result.names or {}
-    for box in result.boxes:
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        p1 = (round(x1 * scale_x), round(y1 * scale_y))
-        p2 = (round(x2 * scale_x), round(y2 * scale_y))
+    detections = result.obb if result.obb is not None else result.boxes
+    for box in detections:
+        if result.obb is not None:
+            corners = box.xyxyxyxy[0].cpu().numpy() * [scale_x, scale_y]
+            points = np.rint(corners).astype(np.int32)
+            cv2.polylines(rendered, [points], True, (0, 255, 0), 2)
+            p1 = tuple(points[points[:, 1].argmin()])
+        else:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            p1 = (round(x1 * scale_x), round(y1 * scale_y))
+            p2 = (round(x2 * scale_x), round(y2 * scale_y))
+            cv2.rectangle(rendered, p1, p2, (0, 255, 0), 2)
         class_id = int(box.cls.item())
         confidence = float(box.conf.item())
         label = f"{names.get(class_id, class_id)} {confidence:.2f}"
-        cv2.rectangle(rendered, p1, p2, (0, 255, 0), 2)
         cv2.putText(rendered, label, (p1[0], max(16, p1[1] - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 0), 1, cv2.LINE_AA)
 
@@ -78,7 +85,7 @@ def main() -> int:
     output_path = args.output / f"{args.rgb.stem}_detections.png"
     if not cv2.imwrite(str(output_path), rendered):
         raise RuntimeError(f"Failed to write: {output_path}")
-    print(f"detections={len(result.boxes)} output={output_path}")
+    print(f"detections={len(detections)} output={output_path}")
     return 0
 
 

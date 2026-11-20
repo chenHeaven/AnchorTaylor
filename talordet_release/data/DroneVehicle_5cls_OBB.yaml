@@ -1,0 +1,15 @@
+# DroneVehicle five-class oriented-box protocol.
+# Canonical infrared polygons; 100-pixel border removed from 840x712 pairs.
+path: /absolute/path/to/DroneVehicle_5cls_OBB
+train: images/train
+val: images/val
+train_ir: image/train
+val_ir: image/val
+
+nc: 5
+names:
+  0: bus
+  1: car
+  2: freight_car
+  3: truck
+  4: van
